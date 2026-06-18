@@ -1590,6 +1590,7 @@ class rocm_aiter_ops:
             "no": ActivationType.No,
             "silu": ActivationType.Silu,
             "gelu": ActivationType.Gelu,
+            "gelu_tanh": ActivationType.GeluTanh,
             "swiglu": ActivationType.Swiglu,
         }
         return mapping.get(name)

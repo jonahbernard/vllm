@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -76,6 +77,145 @@ __all__ = [
     "QuarkOCP_MX_MoEMethod",
     "QuarkNvfp4MoEMethod",
 ]
+
+
+# --- MXFP4 W4A4 MoE numerical verification (debug-only) ----------------------
+# Set VLLM_VERIFY_MXFP4_MOE=1 to compare each AITER_MXFP4_MXFP4 MoE layer's
+# native CK-kernel output against a pure-PyTorch dequantized reference, on the
+# live hidden states. The reference dequantizes the *pre-shuffle* weights with
+# the same trusted `dequant_mxfp4` path used by the emulation backend, applies
+# the same A4 activation QDQ, and runs the MoE in bf16. Mismatches are logged
+# with relative error; the native output is always returned unchanged.
+_VERIFY_MXFP4_MOE = os.environ.get("VLLM_VERIFY_MXFP4_MOE", "0") == "1"
+
+
+def _mxfp4_moe_pytorch_reference(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_deq: torch.Tensor,
+    w2_deq: torch.Tensor,
+    w13_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    activation: MoEActivation,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    """Pure-PyTorch MoE reference over dequantized (un-shuffled) bf16 weights.
+
+    Mirrors the W4A4 native path: per-token A4 quant-dequant on the expert
+    input, stacked gate/up GEMM (gate = first half of w13 rows), gated
+    activation, then the down-projection, summed over the top-k experts.
+
+    Args:
+        x: Hidden states, shape ``(num_tokens, hidden)``.
+        topk_weights: Routing weights, shape ``(num_tokens, top_k)``.
+        topk_ids: Selected expert ids, shape ``(num_tokens, top_k)``.
+        w13_deq: Dequantized gate+up weights, ``(E, 2*inter, hidden)``.
+        w2_deq: Dequantized down weights, ``(E, hidden, inter)``.
+        w13_bias: Optional gate+up bias, ``(E, 2*inter)``.
+        w2_bias: Optional down bias, ``(E, hidden)``.
+        activation: Gated activation applied between the two GEMMs.
+        apply_router_weight_on_input: Whether the router weight multiplies the
+            expert input instead of the expert output.
+
+    Returns:
+        Reference output, shape ``(num_tokens, hidden)``.
+    """
+    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+        quant_dequant_mxfp4,
+    )
+
+    num_tokens, hidden = x.shape
+    top_k = topk_ids.shape[1]
+    compute_dtype = torch.bfloat16
+    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=x.device)
+
+    inter = w2_deq.shape[-1]
+
+    for t in range(num_tokens):
+        for j in range(top_k):
+            e = int(topk_ids[t, j].item())
+            if e < 0 or e >= w13_deq.shape[0]:
+                continue  # masked / non-local expert
+            rw = topk_weights[t, j]
+            xe = x[t : t + 1]
+            if apply_router_weight_on_input:
+                xe = xe * rw
+            # A4 activation quant-dequant (dynamic per-group mxfp4) on input.
+            xe_q = quant_dequant_mxfp4(xe.to(compute_dtype))
+            gate_up = torch.nn.functional.linear(
+                xe_q, w13_deq[e].to(compute_dtype)
+            )
+            if w13_bias is not None:
+                gate_up = gate_up + w13_bias[e].to(compute_dtype)
+            gate = gate_up[:, :inter]
+            up = gate_up[:, inter:]
+            if activation == MoEActivation.GELU_TANH:
+                act = torch.nn.functional.gelu(gate, approximate="tanh")
+            elif activation == MoEActivation.GELU:
+                act = torch.nn.functional.gelu(gate)
+            else:  # SILU default
+                act = torch.nn.functional.silu(gate)
+            h = act * up
+            # A4 quant-dequant on the down-projection input.
+            h_q = quant_dequant_mxfp4(h.to(compute_dtype))
+            down = torch.nn.functional.linear(h_q, w2_deq[e].to(compute_dtype))
+            if w2_bias is not None:
+                down = down + w2_bias[e].to(compute_dtype)
+            if not apply_router_weight_on_input:
+                down = down * rw
+            out[t] += down.to(torch.float32).squeeze(0)
+
+    return out.to(x.dtype)
+
+
+def _verify_mxfp4_moe_output(
+    layer: "RoutedExperts",
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    native_out: torch.Tensor,
+    activation: MoEActivation,
+    apply_router_weight_on_input: bool,
+) -> None:
+    """Compare native MoE output to the PyTorch reference and log the error."""
+    ref_w13 = getattr(layer, "_verify_w13_deq", None)
+    ref_w2 = getattr(layer, "_verify_w2_deq", None)
+    if ref_w13 is None or ref_w2 is None:
+        return
+    try:
+        with torch.no_grad():
+            ref = _mxfp4_moe_pytorch_reference(
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w13_deq=ref_w13,
+                w2_deq=ref_w2,
+                w13_bias=getattr(layer, "_verify_w13_bias", None),
+                w2_bias=getattr(layer, "_verify_w2_bias", None),
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        n = native_out.to(torch.float32)
+        r = ref.to(torch.float32)
+        abs_err = (n - r).abs()
+        denom = r.abs().clamp_min(1e-6)
+        rel = (abs_err / denom).mean().item()
+        max_abs = abs_err.max().item()
+        cos = torch.nn.functional.cosine_similarity(
+            n.flatten(), r.flatten(), dim=0
+        ).item()
+        tag = getattr(layer, "prefix", layer.__class__.__name__)
+        msg = (
+            f"[mxfp4-verify] {tag} tokens={x.shape[0]} "
+            f"mean_rel_err={rel:.4e} max_abs_err={max_abs:.4e} cos_sim={cos:.6f}"
+        )
+        if cos < 0.99 or rel > 0.1:
+            logger.warning("%s  <-- LIKELY MISMATCH", msg)
+        else:
+            logger.info(msg)
+    except Exception as err:  # noqa: BLE001 - debug path, never break inference
+        logger.warning("[mxfp4-verify] reference failed: %s", err)
 
 
 class QuarkMoEMethod(FusedMoEMethodBase):
@@ -1228,6 +1368,46 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
+        # Debug verification: dequantize the *pre-shuffle* weights to bf16 and
+        # stash them on the layer, so apply() can compare the native kernel
+        # output to a pure-PyTorch reference. Done here because the weights are
+        # about to be preshuffled into the CK kernel layout below.
+        if _VERIFY_MXFP4_MOE and (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+        ):
+            try:
+                from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (  # noqa: E501
+                    dequant_mxfp4,
+                )
+
+                with torch.no_grad():
+                    layer._verify_w13_deq = dequant_mxfp4(
+                        layer.w13_weight.data,
+                        layer.w13_weight_scale.data,
+                        torch.bfloat16,
+                    ).contiguous()
+                    layer._verify_w2_deq = dequant_mxfp4(
+                        layer.w2_weight.data,
+                        layer.w2_weight_scale.data,
+                        torch.bfloat16,
+                    ).contiguous()
+                layer._verify_w13_bias = (
+                    w13_bias.data.clone() if w13_bias is not None else None
+                )
+                layer._verify_w2_bias = (
+                    w2_bias.data.clone() if w2_bias is not None else None
+                )
+                logger.info_once(
+                    "[mxfp4-verify] captured dequantized reference weights "
+                    "(w13=%s, w2=%s)",
+                    tuple(layer._verify_w13_deq.shape),
+                    tuple(layer._verify_w2_deq.shape),
+                )
+            except Exception as err:  # noqa: BLE001 - debug path only
+                logger.warning(
+                    "[mxfp4-verify] failed to capture reference weights: %s", err
+                )
+
         # Convert weights to kernel format (handles all backend-specific logic)
         w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
             convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
@@ -1357,7 +1537,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
+        out = self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -1369,6 +1549,24 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             expert_map=layer.expert_map,
             shared_experts_input=shared_experts_input,
         )
+
+        if _VERIFY_MXFP4_MOE and (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+        ):
+            # shared_experts contributions are not part of the reference; only
+            # verify when the routed-experts output is returned standalone.
+            native_out = out[0] if isinstance(out, tuple) else out
+            _verify_mxfp4_moe_output(
+                layer=layer,
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                native_out=native_out,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            )
+
+        return out
 
     def apply_monolithic(
         self,
