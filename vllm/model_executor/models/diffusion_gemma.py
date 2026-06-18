@@ -45,6 +45,7 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.diffgemma_probe import get_probe
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
@@ -1300,6 +1301,26 @@ class DiffusionSampler:
             ST=states.stability_threshold,
             entropy_bound=self.entropy_bound,
         )
+
+        # --- Confidence probe (env-gated; no-op when VLLM_DIFFGEMMA_PROBE unset) ---
+        probe = get_probe()
+        if probe is not None and num_decode > 0:
+            req_ids = getattr(input_batch, "req_ids", None)
+            req_ids_by_slot = None
+            if req_ids is not None:
+                slots_all = input_batch.idx_mapping_np[:num_reqs]
+                req_ids_by_slot = {
+                    int(slots_all[i]): req_ids[i] for i in range(num_reqs)
+                }
+            probe.record_step(
+                scaled=scaled,
+                decode_slots=decode_slots,
+                step_tensor=states.step,
+                is_committing=is_committing,
+                valid_canvas_len_np=valid_canvas_len_np,
+                confidence_threshold=self.confidence_threshold,
+                req_ids_by_slot=req_ids_by_slot,
+            )
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
