@@ -45,6 +45,8 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
+from vllm.model_executor.models.diffgemma_act_probe import get_act_probe
+from vllm.model_executor.models.diffgemma_precision_ctl import get_precision_ctl
 from vllm.model_executor.models.diffgemma_probe import get_probe
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.outputs import LogprobsTensors
@@ -320,6 +322,12 @@ class DiffusionGemmaForConditionalGeneration(
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
             inputs_embeds = None
+        # Activation probe (env-gated): bump the per-forward counter before any
+        # layer runs so each layer's records share this forward's id. The runner
+        # emits the forward_id -> step/slot mapping after sampling.
+        _ap = get_act_probe()
+        if _ap is not None:
+            _ap.begin_forward()
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1216,6 +1224,13 @@ class DiffusionSampler:
         device = logits.device
 
         if input_batch.num_draft_tokens == 0:
+            # Prefill forward: its MoE rows are prompt tokens, not canvas
+            # positions, so any stored committed mask is foreign to it. Drop the
+            # mask so this and the request's first decode forward fall back to
+            # pure fp4 instead of blending against a stale, misaligned pattern.
+            prec_ctl = get_precision_ctl()
+            if prec_ctl is not None:
+                prec_ctl.reset()
             return self._handle_prefill(input_batch, device)
 
         # --- CPU/NumPy setup (outside compile): split decode vs prefill, init
@@ -1321,6 +1336,46 @@ class DiffusionSampler:
                 confidence_threshold=self.confidence_threshold,
                 req_ids_by_slot=req_ids_by_slot,
             )
+
+        # --- Activation probe context (env-gated; independent of logits probe) ---
+        # Map this forward's id to per-slot denoising step / canvas length so the
+        # per-layer activation records can be joined back to (step, position).
+        act_probe = get_act_probe()
+        if act_probe is not None and num_decode > 0:
+            slots_list = decode_slots.tolist()
+            steps_list = states.step[decode_slots].tolist()
+            valid_list = list(valid_canvas_len_np)
+            step_by_slot = {
+                int(slots_list[i]): int(steps_list[i]) for i in range(num_decode)
+            }
+            valid_by_slot = {
+                int(slots_list[i]): int(valid_list[i]) for i in range(num_decode)
+            }
+            req_ids = getattr(input_batch, "req_ids", None)
+            req_id_by_slot = None
+            if req_ids is not None:
+                slots_all = input_batch.idx_mapping_np[:num_reqs]
+                req_id_by_slot = {
+                    int(slots_all[i]): req_ids[i] for i in range(num_reqs)
+                }
+            act_probe.record_context(
+                step_by_slot=step_by_slot,
+                valid_by_slot=valid_by_slot,
+                req_id_by_slot=req_id_by_slot,
+            )
+
+        # --- Mixed-precision controller (env-gated; experiment, mutates numerics) ---
+        # Stash this step's per-position committed mask so the NEXT forward's
+        # emulated MoE can run committed positions in fp4 and uncommitted in
+        # bf16. Committed := per-position entropy below the sampler's threshold,
+        # matching the per-position confidence policy. Same flat order as the
+        # MoE input rows (token order, position == row % CL).
+        prec_ctl = get_precision_ctl()
+        if prec_ctl is not None and num_decode > 0:
+            log_probs = scaled.log_softmax(dim=-1)
+            token_entropy = -(log_probs.exp() * log_probs).sum(dim=-1)  # [nd, CL]
+            committed = token_entropy < self.confidence_threshold
+            prec_ctl.set_committed(committed)
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]

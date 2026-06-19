@@ -23,7 +23,12 @@ Each emitted line is one decode request at one denoising step::
       "n_valid": 32,           # real (non-padded) canvas positions
       "token_entropy": [...],  # per-position entropy, length n_valid
       "max_prob": [...],       # per-position top-1 probability, length n_valid
-      "argmax_token": [...]    # per-position argmax token id, length n_valid
+      "argmax_token": [...],   # per-position argmax token id, length n_valid
+      "topk_token": [[...]],   # per-position top-5 token ids (incl. argmax),
+                               #   shape [n_valid][5], descending by prob
+      "topk_prob": [[...]]     # per-position top-5 probabilities, shape
+                               #   [n_valid][5], descending (topk_prob[i][0] ==
+                               #   max_prob[i])
     }
 
 The probe reads the same temperature-scaled logits the sampler uses, so the
@@ -106,6 +111,10 @@ class DiffgemmaProbe:
         token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
         max_prob = probs.max(dim=-1).values  # [num_decode, CL]
         argmax_token = scaled.argmax(dim=-1)  # [num_decode, CL]
+        # Top-5 candidates per position (descending by prob); topk[...,0] equals
+        # argmax/max_prob above. Clamp k to vocab for tiny-vocab safety.
+        k = min(5, probs.shape[-1])
+        topk_prob, topk_token = probs.topk(k, dim=-1)  # [num_decode, CL, k]
 
         slots = decode_slots.tolist()
         steps = step_tensor[decode_slots].tolist()
@@ -113,6 +122,8 @@ class DiffgemmaProbe:
         ent_cpu = token_entropy.cpu()
         maxp_cpu = max_prob.cpu()
         argmax_cpu = argmax_token.cpu()
+        topk_prob_cpu = topk_prob.cpu()
+        topk_token_cpu = topk_token.cpu()
         valid = list(valid_canvas_len_np)
 
         for i in range(num_decode):
@@ -133,8 +144,15 @@ class DiffgemmaProbe:
                 "token_entropy": [round(x, 5) for x in ent_i.tolist()],
                 "max_prob": [round(x, 5) for x in maxp_cpu[i, :n].tolist()],
                 "argmax_token": argmax_cpu[i, :n].tolist(),
+                "topk_token": topk_token_cpu[i, :n].tolist(),
+                "topk_prob": [[round(x, 5) for x in row]
+                              for row in topk_prob_cpu[i, :n].tolist()],
             }
             self._fh.write(json.dumps(rec) + "\n")
+        # Flush every step so external readers (live tailers, mid-run snapshots)
+        # see records as they are produced instead of when the OS buffer fills.
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
 
     def close(self) -> None:
         try:
