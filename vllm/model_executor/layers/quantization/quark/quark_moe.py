@@ -1161,6 +1161,9 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         self.mxfp4_backend: Mxfp4MoeBackend = Mxfp4MoeBackend.NONE
         self.experts_cls: type[mk.FusedMoEExperts] | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
+        # Per-token mixed-precision experiment (env-gated); set in _setup_kernel
+        # only when VLLM_DIFFGEMMA_MIXED_PREC is set and the backend is W4A4.
+        self._mp_enabled: bool = False
 
         # Used for triton kernel precision configs (W4A8, TRITON backends)
         self.w13_precision_config = None
@@ -1363,10 +1366,105 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def process_weights_after_loading(self, layer):
         self._setup_kernel(layer)
 
+    def _load_bf16_experts(self, layer: RoutedExperts) -> None:
+        """Load the layer's true bf16 expert weights from the original HF card.
+
+        For the per-token mixed-precision experiment the not-yet-committed
+        positions run a full-bf16 expert GEMM. Rather than dequantizing the fp4
+        weights (which only recovers fp4-grid values), this reads the genuine
+        bf16 weights from the un-quantized DiffusionGemma card and stashes them
+        on the layer as ``_mp_w13`` / ``_mp_w2`` in the orientation
+        ``fused_experts`` expects (w13 ``[E, 2I, H]`` with gate=``[:I]``,
+        up=``[I:]``; w2 ``[E, H, I]``).
+
+        Card path comes from ``VLLM_DIFFGEMMA_BF16_CARD`` (default the standard
+        DiffusionGemma card). Runs once per layer at load time, before CUDA-graph
+        capture, so file IO and the extra allocation are safe here.
+
+        Args:
+            layer: the MoE layer; its ``prefix`` (``...layers.{N}.moe.experts``)
+                gives the decoder index used to pick the matching card tensors.
+        """
+        import json
+        import os
+        import re
+
+        from safetensors import safe_open
+
+        card = os.environ.get(
+            "VLLM_DIFFGEMMA_BF16_CARD", "/app/models/diffusiongemma-26B-A4B-it"
+        )
+        # RoutedExperts stores the module path as ``layer_name`` (e.g.
+        # ``model.decoder.layers.{N}.moe.experts``); fall back to ``prefix`` for
+        # other layer types.
+        prefix = getattr(layer, "layer_name", None) or getattr(layer, "prefix", "")
+        m = re.search(r"layers\.(\d+)", prefix)
+        assert m is not None, (
+            f"mixed-prec: cannot derive decoder index from layer name {prefix!r}"
+        )
+        idx = int(m.group(1))
+
+        if getattr(self, "_bf16_index", None) is None:
+            with open(os.path.join(card, "model.safetensors.index.json")) as f:
+                self._bf16_index = json.load(f)["weight_map"]
+
+        gu_key = f"model.decoder.layers.{idx}.experts.gate_up_proj"
+        dn_key = f"model.decoder.layers.{idx}.experts.down_proj"
+        assert gu_key in self._bf16_index and dn_key in self._bf16_index, (
+            f"mixed-prec: {gu_key!r}/{dn_key!r} not found in bf16 card {card!r}"
+        )
+
+        def _load(key: str) -> torch.Tensor:
+            with safe_open(
+                os.path.join(card, self._bf16_index[key]),
+                framework="pt",
+                device="cpu",
+            ) as h:
+                return h.get_tensor(key)
+
+        device = layer.w13_weight.device
+        w13 = _load(gu_key).to(device=device, dtype=torch.bfloat16).contiguous()
+        w2 = _load(dn_key).to(device=device, dtype=torch.bfloat16).contiguous()
+
+        num_experts = layer.w13_weight.shape[0]
+        assert w13.shape[0] == num_experts and w2.shape[0] == num_experts, (
+            f"mixed-prec: card expert count {w13.shape[0]} != layer {num_experts}"
+        )
+        assert w13.shape[1] == 2 * w2.shape[2], (
+            f"mixed-prec: gate_up rows {w13.shape[1]} != 2*intermediate "
+            f"{2 * w2.shape[2]} (card layout mismatch)"
+        )
+        layer._mp_w13 = w13
+        layer._mp_w2 = w2
+
     def _setup_kernel(self, layer: RoutedExperts):
         """Setup kernel using oracle functions for MXFP4 schemes (W4A16, W4A8)."""
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
+
+        # Per-token mixed-precision experiment (env-gated). When enabled on the
+        # native W4A4 backend, load the TRUE bf16 expert weights from the
+        # original (un-quantized) DiffusionGemma HF card now, before the
+        # converter below shuffles the fp4 weights in place into the W4A4 kernel
+        # layout. apply() runs a full-bf16 expert GEMM on these for the not-yet-
+        # committed canvas positions, then blends per token. We load the real
+        # bf16 weights rather than dequantizing the fp4 weights, so the bf16 path
+        # is genuine W4A16-free bf16 (the fp4->bf16 dequant only recovers fp4-grid
+        # values, not the original weights).
+        from vllm.model_executor.models.diffgemma_precision_ctl import (
+            get_precision_ctl,
+        )
+
+        self._mp_enabled = (
+            get_precision_ctl() is not None
+            and self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+        )
+        if self._mp_enabled:
+            assert w13_bias is None and w2_bias is None, (
+                "Mixed-precision MoE experiment assumes no MoE bias; this "
+                "checkpoint has bias and the bf16 path would be wrong."
+            )
+            self._load_bf16_experts(layer)
 
         # Debug verification: dequantize the *pre-shuffle* weights to bf16 and
         # stash them on the layer, so apply() can compare the native kernel
@@ -1460,6 +1558,12 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 routing_tables=layer._expert_routing_tables(),
             )
 
+        if self._mp_enabled:
+            logger.warning_once(
+                "[mixed-prec] enabled: uncommitted positions run full-bf16 "
+                "(dequantized weights), committed positions run native W4A4."
+            )
+
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
@@ -1537,6 +1641,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        if getattr(self, "_mp_enabled", False):
+            logger.warning_once(
+                "[mixed-prec DEBUG] modular apply() path is active "
+                "(_maybe_blend_bf16 WILL be called)."
+            )
         out = self.moe_kernel.apply(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -1549,6 +1658,8 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             expert_map=layer.expert_map,
             shared_experts_input=shared_experts_input,
         )
+
+        out = self._maybe_blend_bf16(layer, x, topk_weights, topk_ids, out)
 
         if _VERIFY_MXFP4_MOE and (
             self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
@@ -1568,6 +1679,99 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         return out
 
+    def _maybe_blend_bf16(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        out: torch.Tensor | tuple,
+    ) -> torch.Tensor | tuple:
+        """Per-token blend of the W4A4 output with a full-bf16 output.
+
+        Committed canvas positions keep the native W4A4 result; uncommitted
+        positions are replaced by a full-bf16 expert GEMM run on the TRUE bf16
+        expert weights loaded from the original HF card (see
+        ``_load_bf16_experts``). Both paths use identical routing; only expert-
+        GEMM precision differs. The committed mask comes from the sampler via the
+        precision controller. No-op until a mask is available (the first decode
+        forward has no mask yet, so that step stays pure W4A4).
+        """
+        if not self._mp_enabled or not hasattr(layer, "_mp_w13"):
+            logger.warning_once(
+                "[mixed-prec DEBUG] _maybe_blend_bf16 EARLY RETURN: "
+                "_mp_enabled=%s hasattr(_mp_w13)=%s -> no blending.",
+                getattr(self, "_mp_enabled", False),
+                hasattr(layer, "_mp_w13"),
+            )
+            return out
+
+        from vllm.model_executor.models.diffgemma_precision_ctl import (
+            get_precision_ctl,
+        )
+
+        ctl = get_precision_ctl()
+        if ctl is None:
+            logger.warning_once(
+                "[mixed-prec DEBUG] _maybe_blend_bf16 EARLY RETURN: ctl is None."
+            )
+            return out
+        y_fp4 = out[0] if isinstance(out, tuple) else out
+        bf16_mask = ctl.bf16_row_mask(y_fp4.shape[0], y_fp4.device, site="moe")
+        if bf16_mask is None or not bool(bf16_mask.any()):
+            logger.warning_once(
+                "[mixed-prec DEBUG] _maybe_blend_bf16 EARLY RETURN: "
+                "mode=%s n_rows=%s mask_is_None=%s mask_any=%s -> pure fp4 "
+                "(NO bf16 rows blended).",
+                ctl.mode,
+                y_fp4.shape[0],
+                bf16_mask is None,
+                bool(bf16_mask.any()) if bf16_mask is not None else False,
+            )
+            return out
+
+        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+
+        logger.warning_once(
+            "[mixed-prec DEBUG] _maybe_blend_bf16 BLENDING: mode=%s n_rows=%s "
+            "bf16_rows=%s/%s (this many rows take the bf16 path).",
+            ctl.mode,
+            y_fp4.shape[0],
+            int(bf16_mask.sum().item()),
+            bf16_mask.numel(),
+        )
+        w13_bf16 = layer._mp_w13.to(x.dtype)
+        w2_bf16 = layer._mp_w2.to(x.dtype)
+        y_bf16 = fused_experts(
+            hidden_states=x,
+            w1=w13_bf16,
+            w2=w2_bf16,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+        )
+        blended = torch.where(bf16_mask.unsqueeze(1), y_bf16, y_fp4)
+        # One-time numeric sanity: how different is the bf16 path from fp4 on the
+        # rows we actually swap? If this is ~0, the "bf16" weights match fp4.
+        if not getattr(self, "_mp_logged_delta", False):
+            self._mp_logged_delta = True
+            sel = bf16_mask
+            d = (y_bf16[sel].float() - y_fp4[sel].float()).abs()
+            denom = y_fp4[sel].float().abs().max() + 1e-6
+            logger.warning(
+                "[mixed-prec DEBUG] bf16-vs-fp4 on swapped rows: "
+                "max_abs=%.4e mean_abs=%.4e rel=%.4e (near 0 => bf16==fp4, BUG).",
+                float(d.max()),
+                float(d.mean()),
+                float(d.max() / denom),
+            )
+        if isinstance(out, tuple):
+            return (blended, *out[1:])
+        return blended
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -1577,6 +1781,12 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
+        if getattr(self, "_mp_enabled", False):
+            logger.warning_once(
+                "[mixed-prec DEBUG] MONOLITHIC apply_monolithic() path is active "
+                "-- _maybe_blend_bf16 is NEVER called here, so mixed-prec/bf16 "
+                "blending is BYPASSED. This is the bug if you see this line."
+            )
         return self.moe_kernel.apply_monolithic(
             hidden_states=x,
             w1=layer.w13_weight,

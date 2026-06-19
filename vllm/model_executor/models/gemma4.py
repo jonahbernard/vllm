@@ -32,6 +32,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -66,6 +67,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
+from .diffgemma_act_probe import get_act_probe
 from .interfaces import (
     EagleModelMixin,
     MixtureOfExperts,
@@ -223,6 +225,7 @@ class Gemma4MLP(nn.Module):
         hidden_activation: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
         # MoE-fp4 + MLP-bf16 benchmark config: the dense MLP runs in full bf16,
@@ -230,6 +233,9 @@ class Gemma4MLP(nn.Module):
         # compute as plain bf16 Linear; the bf16 MLP weights are side-loaded from
         # the un-quantized card in Gemma4Model.load_weights (the quantized card
         # only ships fp4 MLP weights, which are skipped there).
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -246,11 +252,138 @@ class Gemma4MLP(nn.Module):
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
 
+        # Per-token mixed-precision experiment (env-gated; mirrors the MoE expert
+        # bf16 path in quark_moe). When the precision controller is active the
+        # not-yet-committed canvas positions must run this *dense* MLP in true
+        # bf16, not fp4. The quantized card fp4-quantizes mlp.{gate,up,down}_proj
+        # on every layer, so without this the "all-bf16" verification mode still
+        # runs an fp4 dense MLP and cannot match the pure-bf16 server. True bf16
+        # weights are loaded lazily from the un-quantized HF card on first
+        # forward (the experiment runs --enforce-eager, so there is no CUDA-graph
+        # capture to race with) and blended per row via the controller mask.
+        from vllm.model_executor.models.diffgemma_precision_ctl import (
+            get_precision_ctl,
+        )
+
+        self._mp_enabled = get_precision_ctl() is not None
+        self._mp_loaded = False
+
+    def _load_bf16_mlp(self, device: torch.device) -> None:
+        """Load this layer's true bf16 dense-MLP weights from the original card.
+
+        Reads ``model.decoder.layers.{idx}.mlp.{gate,up,down}_proj.weight`` from
+        the un-quantized DiffusionGemma card (``VLLM_DIFFGEMMA_BF16_CARD``) and
+        stashes them, sharded for the current TP rank to match
+        ``MergedColumnParallelLinear`` (gate/up split on output dim) and
+        ``RowParallelLinear`` (down split on input dim), so ``_mp_forward`` runs
+        a genuine W4A16-free bf16 MLP. Runs once per layer.
+        """
+        import json
+        import os
+
+        from safetensors import safe_open
+
+        card = os.environ.get(
+            "VLLM_DIFFGEMMA_BF16_CARD", "/app/models/diffusiongemma-26B-A4B-it"
+        )
+        if Gemma4MLP._mp_index is None:
+            with open(os.path.join(card, "model.safetensors.index.json")) as f:
+                Gemma4MLP._mp_index = json.load(f)["weight_map"]
+        index = Gemma4MLP._mp_index
+
+        def _load(key: str) -> torch.Tensor:
+            assert key in index, (
+                f"mixed-prec: {key!r} not found in bf16 card {card!r}"
+            )
+            with safe_open(
+                os.path.join(card, index[key]), framework="pt", device="cpu"
+            ) as h:
+                return h.get_tensor(key)
+
+        base = f"model.decoder.layers.{self.layer_idx}.mlp"
+        gate = _load(f"{base}.gate_proj.weight").to(torch.bfloat16)
+        up = _load(f"{base}.up_proj.weight").to(torch.bfloat16)
+        down = _load(f"{base}.down_proj.weight").to(torch.bfloat16)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        # gate/up: [I, H] full -> [I_shard, H] for this rank (column parallel).
+        i_full = gate.shape[0]
+        assert i_full % tp_size == 0, (
+            f"mixed-prec: intermediate {i_full} not divisible by TP {tp_size}"
+        )
+        i_shard = i_full // tp_size
+        sl = slice(tp_rank * i_shard, (tp_rank + 1) * i_shard)
+        gate = gate[sl].contiguous()
+        up = up[sl].contiguous()
+        # Merged gate_up in [gate_shard; up_shard] order, matching the fused
+        # act_and_mul kernel's expectation (gate=[:I_shard], up=[I_shard:]).
+        gate_up = torch.cat([gate, up], dim=0).to(device)
+        # down: [H, I] full -> [H, I_shard] for this rank (row parallel).
+        down = down[:, sl].contiguous().to(device)
+
+        self._mp_gate_up = gate_up
+        self._mp_down = down
+        logger.warning_once(
+            "[mixed-prec] dense MLP bf16 path enabled (layer %s): loaded true "
+            "bf16 gate_up=%s down=%s from un-quantized card.",
+            self.layer_idx,
+            tuple(gate_up.shape),
+            tuple(down.shape),
+        )
+
+    def _mp_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the dense MLP on the true bf16 weights (no quantization)."""
+        gate_up = torch.nn.functional.linear(x, self._mp_gate_up.to(x.dtype))
+        h = self.act_fn(gate_up)
+        out = torch.nn.functional.linear(h, self._mp_down.to(x.dtype))
+        if get_tensor_model_parallel_world_size() > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
+    def _maybe_blend_bf16(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Per-row blend of the fp4 MLP output with a true-bf16 MLP output.
+
+        Mirrors ``QuarkW4A4MXFp4MoEMethod._maybe_blend_bf16`` for the dense MLP:
+        uncommitted canvas positions are replaced by a bf16 MLP run on the TRUE
+        bf16 weights from the un-quantized card; committed positions keep the fp4
+        result. The row mask comes from the precision controller and is None
+        until the sampler has produced one (so the first decode forward and all
+        prefills stay pure fp4). In ``bf16`` mode the mask is all-ones, so the
+        whole MLP runs bf16 — the verification knob that should match the pure
+        bf16 server.
+        """
+        from vllm.model_executor.models.diffgemma_precision_ctl import (
+            get_precision_ctl,
+        )
+
+        ctl = get_precision_ctl()
+        if ctl is None:
+            return out
+        bf16_mask = ctl.bf16_row_mask(x.shape[0], x.device, site="mlp")
+        if bf16_mask is None or not bool(bf16_mask.any()):
+            return out
+        if not self._mp_loaded:
+            self._load_bf16_mlp(x.device)
+            self._mp_loaded = True
+        out_bf16 = self._mp_forward(x)
+        return torch.where(bf16_mask.unsqueeze(1), out_bf16, out)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _ap = get_act_probe()
+        if _ap is not None:
+            _ap.record("mlp.gate_up", self.layer_idx, x)
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        h = self.act_fn(gate_up)
+        if _ap is not None:
+            _ap.record("mlp.down", self.layer_idx, h)
+        out, _ = self.down_proj(h)
+        if self._mp_enabled:
+            out = self._maybe_blend_bf16(x, out)
+        return out
+
+    # Shared across all Gemma4MLP layers: the bf16 card's weight_map, read once.
+    _mp_index: dict | None = None
 
 
 class Gemma4Router(nn.Module):
@@ -269,8 +402,10 @@ class Gemma4Router(nn.Module):
         config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
         # RMSNorm without learned weight — pure normalization only
@@ -299,6 +434,9 @@ class Gemma4Router(nn.Module):
         x = self.norm(x)
         x = x * self.root_size.to(x.dtype)
         x = x * self.scale.to(x.dtype)
+        _ap = get_act_probe()
+        if _ap is not None:
+            _ap.record("router", self.layer_idx, x)
         router_logits, _ = self.proj(x)
         return router_logits
 
@@ -319,8 +457,10 @@ class Gemma4MoE(nn.Module):
         config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
 
@@ -367,6 +507,9 @@ class Gemma4MoE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        _ap = get_act_probe()
+        if _ap is not None:
+            _ap.record("moe.predispatch", self.layer_idx, x)
         return self.experts(x, router_logits)
 
 
@@ -437,6 +580,7 @@ class Gemma4Attention(nn.Module):
 
         # Determine layer type and sliding window
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         layer_type = config.layer_types[layer_idx]
         self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
@@ -516,6 +660,9 @@ class Gemma4Attention(nn.Module):
         # Unified QKV path (works for both k_eq_v and standard layers).
         # For k_eq_v, K weights are loaded into both K and V slots of
         # qkv_proj, so V == K automatically.
+        _ap = get_act_probe()
+        if _ap is not None:
+            _ap.record("qkv_proj", self.layer_idx, hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -539,6 +686,8 @@ class Gemma4Attention(nn.Module):
             q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
+        if _ap is not None:
+            _ap.record("o_proj", self.layer_idx, attn_output)
         output, _ = self.o_proj(attn_output)
 
         return output
@@ -618,6 +767,7 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            layer_idx=layer_idx,
         )
 
         # Layer norms: output = norm(x) * weight
@@ -641,11 +791,13 @@ class Gemma4DecoderLayer(nn.Module):
                 config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.router",
+                layer_idx=layer_idx,
             )
             self.moe = Gemma4MoE(
                 config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.moe",
+                layer_idx=layer_idx,
             )
             self.post_feedforward_layernorm_1 = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -743,9 +895,14 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
+            _ap = get_act_probe()
+            if _ap is not None:
+                _ap.record("ple.gate", self.layer_idx, hidden_states)
             gate = self.per_layer_input_gate(hidden_states)
             gate = torch.nn.functional.gelu(gate, approximate="tanh")
             gated_per_layer = gate * per_layer_input
+            if _ap is not None:
+                _ap.record("ple.proj", self.layer_idx, gated_per_layer)
             per_layer_contribution = self.per_layer_projection(gated_per_layer)
             per_layer_contribution = self.post_per_layer_input_norm(
                 per_layer_contribution
