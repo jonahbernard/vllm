@@ -225,18 +225,23 @@ class Gemma4MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # MoE-fp4 + MLP-bf16 benchmark config: the dense MLP runs in full bf16,
+        # never fp4. quant_config is forced to None so these projections load and
+        # compute as plain bf16 Linear; the bf16 MLP weights are side-loaded from
+        # the un-quantized card in Gemma4Model.load_weights (the quantized card
+        # only ships fp4 MLP weights, which are skipped there).
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
@@ -1407,6 +1412,13 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         params_dict.update(dict(self.named_buffers()))
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # MoE-fp4 + MLP-bf16 benchmark config: the dense MLP runs in bf16 and
+            # its weights are side-loaded from the un-quantized card after this
+            # loop. The fp4 dense-MLP weights/scales shipped in the quantized card
+            # do not fit the bf16 Linear params, so skip them here. (Matches only
+            # the per-layer dense MLP, not MoE experts or the vision tower.)
+            if re.search(r"\.mlp\.(gate|up|down)_proj\.weight(_scale)?$", name):
+                continue
             if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
                 remapped_name = maybe_remap_kv_scale_name(name, params_dict)
                 if remapped_name is not None and remapped_name in params_dict:
@@ -1495,7 +1507,86 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        # MoE-fp4 + MLP-bf16 benchmark config: side-load the true bf16 dense-MLP
+        # weights from the un-quantized card (the quantized card's fp4 MLP
+        # weights were skipped above).
+        loaded_params |= self._load_bf16_mlp_weights(params_dict)
+
         return loaded_params
+
+    def _load_bf16_mlp_weights(self, params_dict: dict) -> set[str]:
+        """Load true bf16 dense-MLP weights from the un-quantized card.
+
+        For the MoE-fp4 + MLP-bf16 benchmark, the dense MLP projections are plain
+        bf16 Linear (quant_config forced to None). The served (quantized) card
+        only ships fp4 MLP weights, so the genuine bf16 weights are read here from
+        ``VLLM_DIFFGEMMA_BF16_CARD`` (default the standard DiffusionGemma card)
+        and written, sharded for this TP rank, into ``mlp.gate_up_proj.weight``
+        (gate/up concatenated on the output dim, gate=[:I], up=[I:]) and
+        ``mlp.down_proj.weight`` (split on the input dim). Runs once at load time,
+        before CUDA-graph capture, so the file IO is safe.
+
+        Returns the set of param names it loaded so the caller can mark them.
+        """
+        import json
+        import os
+
+        from safetensors import safe_open
+
+        card = os.environ.get(
+            "VLLM_DIFFGEMMA_BF16_CARD", "/app/models/diffusiongemma-26B-A4B-it"
+        )
+        with open(os.path.join(card, "model.safetensors.index.json")) as f:
+            index = json.load(f)["weight_map"]
+
+        def _load(key: str) -> torch.Tensor:
+            assert key in index, f"MLP-bf16: {key!r} not found in card {card!r}"
+            with safe_open(
+                os.path.join(card, index[key]), framework="pt", device="cpu"
+            ) as h:
+                return h.get_tensor(key)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        loaded: set[str] = set()
+        for gate_up_name in [
+            n for n in params_dict if n.endswith("mlp.gate_up_proj.weight")
+        ]:
+            base = gate_up_name[: -len(".gate_up_proj.weight")]
+            down_name = base + ".down_proj.weight"
+            if is_pp_missing_parameter(gate_up_name, self):
+                continue
+            idx = extract_layer_index(base)
+            card_base = f"model.decoder.layers.{idx}.mlp"
+            gate = _load(f"{card_base}.gate_proj.weight").to(torch.bfloat16)
+            up = _load(f"{card_base}.up_proj.weight").to(torch.bfloat16)
+            down = _load(f"{card_base}.down_proj.weight").to(torch.bfloat16)
+
+            # gate/up: [I, H] full -> [I_shard, H] for this rank (column parallel).
+            i_full = gate.shape[0]
+            assert i_full % tp_size == 0, (
+                f"MLP-bf16: intermediate {i_full} not divisible by TP {tp_size}"
+            )
+            i_shard = i_full // tp_size
+            sl = slice(tp_rank * i_shard, (tp_rank + 1) * i_shard)
+            gate_up = torch.cat([gate[sl], up[sl]], dim=0).contiguous()
+            # down: [H, I] full -> [H, I_shard] for this rank (row parallel).
+            down = down[:, sl].contiguous()
+
+            gu_param = params_dict[gate_up_name]
+            dn_param = params_dict[down_name]
+            gu_param.data.copy_(gate_up.to(gu_param.device, gu_param.dtype))
+            dn_param.data.copy_(down.to(dn_param.device, dn_param.dtype))
+            loaded.add(gate_up_name)
+            loaded.add(down_name)
+
+        logger.info(
+            "[MLP-bf16] side-loaded true bf16 dense-MLP weights for %d layers "
+            "from %s",
+            len(loaded) // 2,
+            card,
+        )
+        return loaded
 
 
 class Gemma4ForCausalLM(
